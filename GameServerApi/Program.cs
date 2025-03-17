@@ -1,5 +1,6 @@
 using System.Text;
 using GameServerApi.Data;
+using GameServerApi.Helpers;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
@@ -36,6 +37,8 @@ builder.Services.AddAuthentication(options =>
         IssuerSigningKey = new SymmetricSecurityKey(key)
     };
 });
+
+builder.Services.AddSingleton<JwtHelper>();
 
 builder.Services.AddControllers();
 

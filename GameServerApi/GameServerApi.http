@@ -4,3 +4,11 @@ GET {{GameServerApi_HostAddress}}/weatherforecast/
 Accept: application/json
 
 ###
+POST {{GameServerApi_HostAddress}}/api/auth/register/
+Accept: application/json
+Content-Type: application/json
+{
+  "email": "test@example.com",
+  "password": "Password123!"
+}
+###
