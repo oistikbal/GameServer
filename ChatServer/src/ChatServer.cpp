@@ -1,11 +1,109 @@
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
-#include "ChatServer.h"
+#include "chatserver.h"
+#include <MSWSock.h>
 
-namespace ChatServer
+namespace chatserver
 {
-    bool Initialize(ServerState& state) 
+    struct server
+    {
+        static constexpr size_t MAX_CONNECTIONS = 64;
+        static constexpr size_t BUFFER_SIZE = 128;
+
+        SOCKET listen_socket = INVALID_SOCKET;
+        HANDLE iocp_handle = nullptr;
+        SSL_CTX* ssl_context = nullptr;
+    };
+}
+
+static chatserver::server g_server = {};
+
+namespace chatserver
+{
+    static void send(SOCKET clientSocket, const char* message)
+    {
+        WSABUF wsabuf;
+        wsabuf.buf = (char*)message;
+        wsabuf.len = static_cast<ULONG>(strlen(message));
+
+        DWORD bytesSent = 0;
+        DWORD flags = 0;
+        OVERLAPPED* overlapped = new OVERLAPPED();
+
+        ZeroMemory(overlapped, sizeof(OVERLAPPED));
+
+        int result = WSASend(clientSocket, &wsabuf, 1, &bytesSent, flags, overlapped, NULL);
+        if (result == SOCKET_ERROR) {
+            int errCode = WSAGetLastError();
+            if (errCode != WSA_IO_PENDING) {
+                std::cerr << "WSASend failed with error: " << errCode << std::endl;
+            }
+            else {
+                std::cout << "WSASend is pending, waiting for completion..." << std::endl;
+            }
+        }
+        else {
+            std::cout << "Sent data immediately, bytes sent: " << bytesSent << std::endl;
+        }
+
+        delete overlapped;
+    }
+
+
+    static void receive(SOCKET clientSocket) 
+    {
+        WSABUF buffer;
+        buffer.buf = new char[g_server.BUFFER_SIZE];
+        buffer.len = g_server.BUFFER_SIZE;
+
+        DWORD flags = 0;
+        OVERLAPPED* overlapped = new OVERLAPPED();
+        ZeroMemory(overlapped, sizeof(OVERLAPPED));
+
+        DWORD bytesReceived = 0;
+
+        int result = WSARecv(clientSocket, &buffer, 1, &bytesReceived, &flags, overlapped, nullptr);
+        if (result == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
+            std::cerr << "WSARecv failed with error: " << WSAGetLastError() << std::endl;
+            delete[] buffer.buf;
+            delete overlapped;
+            return;
+        }
+
+        std::cout << "Received " << bytesReceived << " bytes." << std::endl;
+
+        if (bytesReceived > 0) {
+            buffer.buf[bytesReceived] = '\0';
+
+            std::cout << "Received Data: " << (const char*)buffer.buf << std::endl;
+            chatserver::send(clientSocket, buffer.buf);
+        }
+
+        delete[] buffer.buf;
+        delete overlapped;
+    }
+
+    static void worker_thread() 
+    {
+        DWORD bytesTransferred;
+        ULONG_PTR completionKey;
+        OVERLAPPED* overlapped;
+        SOCKET clientSocket;
+
+        while (true) {
+            BOOL result = GetQueuedCompletionStatus(g_server.iocp_handle, &bytesTransferred, &completionKey, &overlapped, INFINITE);
+            if (result == 0 || bytesTransferred == 0) {
+                std::cerr << "Error or client disconnected" << std::endl;
+                break;
+            }
+
+            receive((SOCKET)completionKey);
+        }
+    }
+
+    bool initialize()
     {
         WSADATA wsaData;
         if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
@@ -13,166 +111,89 @@ namespace ChatServer
             return false;
         }
 
-        state.iocp_handle = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
-        if (!state.iocp_handle) {
-            std::cerr << "IOCP creation failed" << std::endl;
-            return false;
-        }
-
         SSL_load_error_strings();
         OpenSSL_add_ssl_algorithms();
         SSL_library_init();
 
-        state.ssl_context = SSL_CTX_new(TLS_server_method());
-        if (!state.ssl_context) {
+        g_server.ssl_context = SSL_CTX_new(TLS_server_method());
+        if (!g_server.ssl_context) {
             std::cerr << "SSL context creation failed" << std::endl;
             return false;
         }
 
-        std::fill(state.connection_active.begin(), state.connection_active.end(), false);
-        std::fill(state.sockets.begin(), state.sockets.end(), INVALID_SOCKET);
+        return true;
+    }
+
+    bool start_listening(const char* ipAddress, int port)
+    {
+        g_server.listen_socket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+
+        if (g_server.listen_socket == SOCKET_ERROR)
+        {
+            std::cerr << "Failed to create listen socket" << std::endl;
+            return false;
+        }
+
+        sockaddr_in serverAddr = {};
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_addr.s_addr = inet_addr(ipAddress);
+        serverAddr.sin_port = htons(port);
+
+        if (bind(g_server.listen_socket, reinterpret_cast<const sockaddr*>(&serverAddr), sizeof(serverAddr)) == SOCKET_ERROR) 
+        {
+            std::cerr << "Failed to bind listen socket" << std::endl;
+            return false;
+        }
+
+        if (listen(g_server.listen_socket, SOMAXCONN) == SOCKET_ERROR) 
+        {
+            std::cerr << "Failed to listen socket" << std::endl;
+            return false;
+        }
+
+        g_server.iocp_handle = CreateIoCompletionPort(reinterpret_cast<HANDLE>(g_server.listen_socket), NULL, 0, 0);
+        if (!g_server.iocp_handle) 
+        {
+            std::cerr << "IOCP creation failed" << std::endl;
+            return false;
+        }
 
         return true;
     }
 
-    size_t FindFreeConnectionSlot(ServerState& state) 
+    void run()
     {
-        for (size_t i = 0; i < ServerState::MAX_CONNECTIONS; ++i) {
-            bool expected = false;
-            if (state.connection_active[i].compare_exchange_strong(expected, true)) {
-                return i;
-            }
-        }
-        return ServerState::MAX_CONNECTIONS;
-    }
+        std::thread t(worker_thread);
+        t.detach();
 
-    void AcceptNewConnection(ServerState& state) 
-    {
-        size_t slot = FindFreeConnectionSlot(state);
-        if (slot == ServerState::MAX_CONNECTIONS) {
-            std::cerr << "Max connections reached" << std::endl;
-            return;
-        }
-
-        state.sockets[slot] = accept(state.listen_socket, NULL, NULL);
-        if (state.sockets[slot] == INVALID_SOCKET) {
-            std::cerr << "Accept failed: " << WSAGetLastError() << std::endl;
-            state.connection_active[slot] = false;
-            return;
-        }
-
-        CreateIoCompletionPort(
-            reinterpret_cast<HANDLE>(state.sockets[slot]),
-            state.iocp_handle,
-            slot,
-            0
-        );
-
-        state.ssl_connections[slot] = SSL_new(state.ssl_context);
-        SSL_set_fd(state.ssl_connections[slot], state.sockets[slot]);
-        SSL_accept(state.ssl_connections[slot]);
-
-        ++state.active_connection_count;
-    }
-
-    void ProcessReceivedData(ServerState& state, size_t connection_index, DWORD bytes_transferred) 
-    {
-        if (bytes_transferred == 0) {
-            closesocket(state.sockets[connection_index]);
-            SSL_free(state.ssl_connections[connection_index]);
-            state.connection_active[connection_index] = false;
-            --state.active_connection_count;
-            return;
-        }
-
-        char* buffer = &state.receive_buffers[connection_index * ServerState::BUFFER_SIZE];
-        state.buffer_sizes[connection_index] = bytes_transferred;
-
-        std::cout << "Received " << bytes_transferred
-            << " bytes from connection " << connection_index << std::endl;
-    }
-
-    void Run(ServerState& state) 
-    {
-        while (true) {
-            DWORD bytes_transferred = 0;
-            ULONG_PTR completion_key = 0;
-            OVERLAPPED* overlapped = nullptr;
-
-            BOOL result = GetQueuedCompletionStatus(
-                state.iocp_handle,
-                &bytes_transferred,
-                &completion_key,
-                &overlapped,
-                INFINITE
-            );
-
-            if (!result) {
-                if (overlapped == nullptr) {
-                    std::cerr << "IOCP error: " << GetLastError() << std::endl;
-                    break;
-                }
+        while (true) 
+        {
+            sockaddr_in clientAddr;
+            int clientAddrSize = sizeof(clientAddr);
+            SOCKET clientSocket = accept(g_server.listen_socket, (sockaddr*)&clientAddr, &clientAddrSize);
+            if (clientSocket == INVALID_SOCKET) {
+                std::cerr << "Failed to accept client connection" << std::endl;
+                return;
             }
 
-            if (completion_key == 0) {
-                AcceptNewConnection(state);
-            }
-            else {
-                ProcessReceivedData(state, completion_key, bytes_transferred);
-            }
+            std::cout << "Connection accepted " << clientSocket << std::endl;
+
+            CreateIoCompletionPort((HANDLE)clientSocket, g_server.iocp_handle, (ULONG_PTR)clientSocket, 0);
+
+            receive(clientSocket);
         }
     }
 
-    bool StartListening(ServerState& state, const char* ipAddress, int port) 
+    void shutdown()
     {
-        state.listen_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (state.listen_socket == INVALID_SOCKET) {
-            std::cerr << "Socket creation failed: " << WSAGetLastError() << std::endl;
-            return false;
+        if (g_server.listen_socket != INVALID_SOCKET) {
+            closesocket(g_server.listen_socket);
         }
-
-        sockaddr_in service;
-        service.sin_family = AF_INET;
-        service.sin_addr.s_addr = inet_addr(ipAddress);
-        service.sin_port = htons(port);
-
-        if (bind(state.listen_socket, (SOCKADDR*)&service, sizeof(service)) == SOCKET_ERROR) {
-            std::cerr << "Bind failed: " << WSAGetLastError() << std::endl;
-            closesocket(state.listen_socket);
-            return false;
+        if (g_server.iocp_handle) {
+            CloseHandle(g_server.iocp_handle);
         }
-
-        if (listen(state.listen_socket, SOMAXCONN) == SOCKET_ERROR) {
-            std::cerr << "Listen failed: " << WSAGetLastError() << std::endl;
-            closesocket(state.listen_socket);
-            return false;
-        }
-
-        CreateIoCompletionPort(
-            reinterpret_cast<HANDLE>(state.listen_socket),
-            state.iocp_handle,
-            0,
-            0
-        );
-
-        return true;
-    }
-
-    void Shutdown(ServerState& state) 
-    {
-        for (size_t i = 0; i < ServerState::MAX_CONNECTIONS; ++i) {
-            if (state.connection_active[i]) {
-                closesocket(state.sockets[i]);
-                SSL_free(state.ssl_connections[i]);
-            }
-        }
-
-        if (state.listen_socket != INVALID_SOCKET) {
-            closesocket(state.listen_socket);
-        }
-
-        if (state.ssl_context) {
-            SSL_CTX_free(state.ssl_context);
+        if (g_server.ssl_context) {
+            SSL_CTX_free(g_server.ssl_context);
         }
 
         WSACleanup();

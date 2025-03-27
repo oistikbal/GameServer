@@ -4,7 +4,7 @@ add_executable(ChatServer)
 
 target_sources(ChatServer PRIVATE 
     src/main.cpp
-    src/ChatServer.cpp
+    src/chatserver.cpp
 )
 
 target_include_directories(ChatServer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

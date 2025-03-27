@@ -1,25 +1,26 @@
 #include <iostream>
 
-#include "ChatServer.h"
+#include "chatserver.h"
 
-int main() 
+int main(int argc, char* argv[])
 {
-    ChatServer::ServerState serverState = {};
+    constexpr char address[]  = "127.0.0.1";
+    constexpr int port = 3131;
 
-    if (!ChatServer::Initialize(serverState)) 
+    if (!chatserver::initialize()) 
     {
         std::cerr << "ChatServer failed to initialize";
         return 1;
     }
-    if (!ChatServer::StartListening(serverState, "localhost", 3000))
+    if (!chatserver::start_listening(address, port))
     {
         std::cerr << "ChatServer failed to listen";
         return 1;
     }
 
-    std::cout << "ChatServer Initialized\n" ;
-    ChatServer::Run(serverState);
+    std::cout << "ChatServer listening at " << address << ":" << port << std::endl; ;
+    chatserver::run();
 
-    ChatServer::Shutdown(serverState);
+    chatserver::shutdown();
     return 0;
 }
