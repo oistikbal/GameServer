@@ -5,7 +5,7 @@
 int main(int argc, char* argv[])
 {
     constexpr char address[]  = "127.0.0.1";
-    constexpr int port = 3131;
+    constexpr int port = 3000;
 
     if (!chatserver::initialize()) 
     {

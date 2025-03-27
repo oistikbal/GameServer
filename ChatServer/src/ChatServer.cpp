@@ -16,6 +16,13 @@ namespace chatserver
         HANDLE iocp_handle = nullptr;
         SSL_CTX* ssl_context = nullptr;
     };
+
+    struct io_context {
+        OVERLAPPED overlapped;
+        WSABUF buffer;
+        char data[server::BUFFER_SIZE];
+        SOCKET clientSocket;
+    };
 }
 
 static chatserver::server g_server = {};
@@ -54,35 +61,20 @@ namespace chatserver
 
     static void receive(SOCKET clientSocket) 
     {
-        WSABUF buffer;
-        buffer.buf = new char[g_server.BUFFER_SIZE];
-        buffer.len = g_server.BUFFER_SIZE;
+        io_context* context = new io_context();
+        context->buffer.buf = context->data;
+        context->buffer.len = g_server.BUFFER_SIZE - 1;
+        context->clientSocket = clientSocket;
+        ZeroMemory(&context->overlapped, sizeof(OVERLAPPED));
 
         DWORD flags = 0;
-        OVERLAPPED* overlapped = new OVERLAPPED();
-        ZeroMemory(overlapped, sizeof(OVERLAPPED));
-
         DWORD bytesReceived = 0;
 
-        int result = WSARecv(clientSocket, &buffer, 1, &bytesReceived, &flags, overlapped, nullptr);
+        int result = WSARecv(clientSocket, &context->buffer, 1, &bytesReceived, &flags, &context->overlapped, nullptr);
         if (result == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
             std::cerr << "WSARecv failed with error: " << WSAGetLastError() << std::endl;
-            delete[] buffer.buf;
-            delete overlapped;
-            return;
+            delete context;
         }
-
-        std::cout << "Received " << bytesReceived << " bytes." << std::endl;
-
-        if (bytesReceived > 0) {
-            buffer.buf[bytesReceived] = '\0';
-
-            std::cout << "Received Data: " << (const char*)buffer.buf << std::endl;
-            chatserver::send(clientSocket, buffer.buf);
-        }
-
-        delete[] buffer.buf;
-        delete overlapped;
     }
 
     static void worker_thread() 
@@ -99,7 +91,17 @@ namespace chatserver
                 break;
             }
 
-            receive((SOCKET)completionKey);
+            io_context* context = reinterpret_cast<io_context*>(overlapped);
+            SOCKET clientSocket = (SOCKET)completionKey;
+
+            std::cout << "Received " << bytesTransferred << " bytes." << std::endl;
+            if (bytesTransferred > 0) {
+                context->buffer.buf[bytesTransferred] = '\0';
+                std::cout << "Received Data: " << context->buffer.buf << std::endl;
+            }
+
+            receive(clientSocket);
+            delete context;
         }
     }
 
