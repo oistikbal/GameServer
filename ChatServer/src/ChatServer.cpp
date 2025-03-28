@@ -1,9 +1,15 @@
+#define WIN32_LEAN_AND_MEAN
+
+
 #include <iostream>
-#include <stdexcept>
-#include <thread>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <WinSock2.h>
+#include <MSWSock.h>
+#include <windows.h>
+#include <process.h>
 
 #include "chatserver.h"
-#include <MSWSock.h>
 
 namespace chatserver
 {
@@ -77,7 +83,7 @@ namespace chatserver
         }
     }
 
-    static void worker_thread() 
+    static unsigned int WINAPI worker_thread(void* lpParam)
     {
         DWORD bytesTransferred;
         ULONG_PTR completionKey;
@@ -103,6 +109,8 @@ namespace chatserver
             receive(clientSocket);
             delete context;
         }
+
+        return 0;
     }
 
     bool initialize()
@@ -163,10 +171,12 @@ namespace chatserver
         return true;
     }
 
-    void run()
+    void run(int thread_count)
     {
-        std::thread t(worker_thread);
-        t.detach();
+        for (int i = 0; i < thread_count; i++) 
+        {
+            _beginthreadex(nullptr, 0, worker_thread, nullptr, 0, nullptr);
+        }
 
         while (true) 
         {
