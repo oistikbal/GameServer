@@ -1,3 +1,4 @@
+#include <Windows.h>
 #include <iostream>
 
 #include "chatserver.h"
@@ -10,13 +11,13 @@ int main(int argc, char* argv[])
     int threadCount = 1;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-threadcount") == 0 && i + 1 < argc) {
+        if (CompareString(LOCALE_USER_DEFAULT, 0, argv[i], -1, "-threadcount", -1) == CSTR_EQUAL && i + 1 < argc) {
             threadCount = atoi(argv[i + 1]);
             if (threadCount <= 0) {
-                printf("Invalid thread count. Defaulting to 1.\n");
+                std::cout << ("Invalid thread count. Defaulting to 1.\n");
                 threadCount = 1;
             }
-            i++; 
+            i++;
         }
     }
 

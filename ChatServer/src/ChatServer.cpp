@@ -1,9 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 
-
 #include <iostream>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
 #include <WinSock2.h>
 #include <MSWSock.h>
 #include <windows.h>
@@ -20,7 +17,7 @@ namespace chatserver
 
         SOCKET listen_socket = INVALID_SOCKET;
         HANDLE iocp_handle = nullptr;
-        SSL_CTX* ssl_context = nullptr;
+        size_t online_connections;
     };
 
     struct io_context {
@@ -32,84 +29,101 @@ namespace chatserver
 }
 
 static chatserver::server g_server = {};
+static chatserver::io_context g_contexts[chatserver::server::MAX_CONNECTIONS];
 
 namespace chatserver
 {
-    static void send(SOCKET clientSocket, const char* message)
-    {
+    static void send(size_t context_index, const char* message) {
         WSABUF wsabuf;
         wsabuf.buf = (char*)message;
         wsabuf.len = static_cast<ULONG>(strlen(message));
 
         DWORD bytesSent = 0;
         DWORD flags = 0;
-        OVERLAPPED* overlapped = new OVERLAPPED();
 
-        ZeroMemory(overlapped, sizeof(OVERLAPPED));
+        // Use the context's overlapped structure
+        ZeroMemory(&g_contexts[context_index].overlapped, sizeof(OVERLAPPED));
 
-        int result = WSASend(clientSocket, &wsabuf, 1, &bytesSent, flags, overlapped, NULL);
+        int result = WSASend(g_contexts[context_index].clientSocket, &wsabuf, 1, &bytesSent, flags, &g_contexts[context_index].overlapped, NULL);
         if (result == SOCKET_ERROR) {
             int errCode = WSAGetLastError();
             if (errCode != WSA_IO_PENDING) {
                 std::cerr << "WSASend failed with error: " << errCode << std::endl;
             }
             else {
-                std::cout << "WSASend is pending, waiting for completion..." << std::endl;
+                std::cout << "WSASend is pending..." << std::endl;
             }
         }
         else {
             std::cout << "Sent data immediately, bytes sent: " << bytesSent << std::endl;
         }
-
-        delete overlapped;
     }
 
 
-    static void receive(SOCKET clientSocket) 
+    static void receive(size_t context_index)
     {
-        io_context* context = new io_context();
+        io_context* context = &g_contexts[context_index];
         context->buffer.buf = context->data;
         context->buffer.len = g_server.BUFFER_SIZE - 1;
-        context->clientSocket = clientSocket;
         ZeroMemory(&context->overlapped, sizeof(OVERLAPPED));
 
         DWORD flags = 0;
         DWORD bytesReceived = 0;
 
-        int result = WSARecv(clientSocket, &context->buffer, 1, &bytesReceived, &flags, &context->overlapped, nullptr);
+        int result = WSARecv(context->clientSocket, &context->buffer, 1, &bytesReceived, &flags, &context->overlapped, nullptr);
         if (result == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
             std::cerr << "WSARecv failed with error: " << WSAGetLastError() << std::endl;
-            delete context;
         }
     }
 
-    static unsigned int WINAPI worker_thread(void* lpParam)
-    {
-        DWORD bytesTransferred;
-        ULONG_PTR completionKey;
-        OVERLAPPED* overlapped;
-        SOCKET clientSocket;
-
+    static unsigned int WINAPI worker_thread(void* lpParam) {
         while (true) {
+            DWORD bytesTransferred;
+            ULONG_PTR completionKey;
+            OVERLAPPED* overlapped;
+
             BOOL result = GetQueuedCompletionStatus(g_server.iocp_handle, &bytesTransferred, &completionKey, &overlapped, INFINITE);
-            if (result == 0 || bytesTransferred == 0) {
-                std::cerr << "Error or client disconnected" << std::endl;
-                break;
+            if (result == FALSE) {
+                DWORD error = GetLastError();
+                if (error == ERROR_ABANDONED_WAIT_0) {
+                    std::cerr << "Completion port closed. Exiting worker thread." << std::endl;
+                    break;
+                }
+                if (overlapped == nullptr) {
+                    std::cerr << "GetQueuedCompletionStatus failed with error: " << error << std::endl;
+                    continue;
+                }
             }
 
-            io_context* context = reinterpret_cast<io_context*>(overlapped);
-            SOCKET clientSocket = (SOCKET)completionKey;
+            io_context* context = &g_contexts[(size_t)completionKey];
 
-            std::cout << "Received " << bytesTransferred << " bytes." << std::endl;
+            if (bytesTransferred == 0) {
+                // Client disconnected
+                if (context->clientSocket != INVALID_SOCKET) {
+                    std::cerr << "Client disconnected (Index: " << completionKey << ")\n";
+                    closesocket(context->clientSocket);
+                    context->clientSocket = INVALID_SOCKET;
+                }
+                continue;
+            }
+
             if (bytesTransferred > 0) {
+                std::cout << "Received " << bytesTransferred << " bytes." << std::endl;
+                // Null-terminate the received data
                 context->buffer.buf[bytesTransferred] = '\0';
                 std::cout << "Received Data: " << context->buffer.buf << std::endl;
+
+                // Broadcast to all other connected clients
+                for (int i = 0; i < server::MAX_CONNECTIONS; i++) {
+                    if (g_contexts[i].clientSocket != INVALID_SOCKET && i != completionKey) {
+                        send(i, context->buffer.buf);
+                    }
+                }
+
+                // Post another receive operation for this client
+                receive(completionKey);
             }
-
-            receive(clientSocket);
-            delete context;
         }
-
         return 0;
     }
 
@@ -121,14 +135,11 @@ namespace chatserver
             return false;
         }
 
-        SSL_load_error_strings();
-        OpenSSL_add_ssl_algorithms();
-        SSL_library_init();
-
-        g_server.ssl_context = SSL_CTX_new(TLS_server_method());
-        if (!g_server.ssl_context) {
-            std::cerr << "SSL context creation failed" << std::endl;
-            return false;
+        for (int i = 0; i < server::MAX_CONNECTIONS; i++) {
+            g_contexts[i].clientSocket = INVALID_SOCKET;
+            g_contexts[i].buffer.buf = g_contexts[i].data;
+            g_contexts[i].buffer.len = server::BUFFER_SIZE - 1;
+            ZeroMemory(&g_contexts[i].overlapped, sizeof(OVERLAPPED));
         }
 
         return true;
@@ -182,17 +193,26 @@ namespace chatserver
         {
             sockaddr_in clientAddr;
             int clientAddrSize = sizeof(clientAddr);
-            SOCKET clientSocket = accept(g_server.listen_socket, (sockaddr*)&clientAddr, &clientAddrSize);
-            if (clientSocket == INVALID_SOCKET) {
+            size_t context_index = 0;
+            for (size_t i = 0; i < server::MAX_CONNECTIONS; i++)
+            {
+                if (g_contexts[i].clientSocket == INVALID_SOCKET)
+                {
+                    context_index = i;
+                    break;
+                }
+            }
+
+            g_contexts[context_index].clientSocket = accept(g_server.listen_socket, (sockaddr*)&clientAddr, &clientAddrSize);
+            if (g_contexts[context_index].clientSocket == INVALID_SOCKET) {
                 std::cerr << "Failed to accept client connection" << std::endl;
                 return;
             }
 
-            std::cout << "Connection accepted " << clientSocket << std::endl;
+            std::cout << "Client Accepted (Index: " << context_index << ")\n";
+            CreateIoCompletionPort((HANDLE)g_contexts[context_index].clientSocket, g_server.iocp_handle, (ULONG_PTR)context_index, 0);
 
-            CreateIoCompletionPort((HANDLE)clientSocket, g_server.iocp_handle, (ULONG_PTR)clientSocket, 0);
-
-            receive(clientSocket);
+            receive(context_index);
         }
     }
 
@@ -203,9 +223,6 @@ namespace chatserver
         }
         if (g_server.iocp_handle) {
             CloseHandle(g_server.iocp_handle);
-        }
-        if (g_server.ssl_context) {
-            SSL_CTX_free(g_server.ssl_context);
         }
 
         WSACleanup();

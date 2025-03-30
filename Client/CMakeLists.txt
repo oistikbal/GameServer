@@ -6,7 +6,7 @@ target_sources(Client PRIVATE
     src/main.cpp
 )
 
-target_include_directories(Client PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(Client PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/inc)
 
 set_target_properties(Client PROPERTIES CXX_STANDARD 20)
 

@@ -7,6 +7,7 @@
 #include <conio.h>
 
 
+
 void receive_messages(SOCKET client_socket) {
     char buffer[128];
     while (true) {
@@ -95,9 +96,9 @@ int main() {
         if (message == "exit") {
             break;
         }
-
         send_message(client_socket, message);
     }
+
 
     closesocket(client_socket);
     WSACleanup();
