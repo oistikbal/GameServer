@@ -35,6 +35,8 @@ namespace GameServerApi.Controllers
             if (result.Succeeded)
                 return Ok(new { message = "User registered successfully" });
 
+            var a = new System.IO.BinaryReader();
+
             return BadRequest(result.Errors);
         }
 

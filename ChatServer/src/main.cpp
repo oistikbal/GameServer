@@ -8,7 +8,7 @@ int main(int argc, char* argv[])
     constexpr char address[]  = "127.0.0.1";
     constexpr int port = 3000;
 
-    int threadCount = 1;
+    int threadCount = 4;
 
     for (int i = 1; i < argc; i++) {
         if (CompareString(LOCALE_USER_DEFAULT, 0, argv[i], -1, "-threadcount", -1) == CSTR_EQUAL && i + 1 < argc) {

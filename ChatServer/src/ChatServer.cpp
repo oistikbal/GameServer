@@ -1,230 +1,255 @@
 #define WIN32_LEAN_AND_MEAN
 
-#include <iostream>
 #include <WinSock2.h>
-#include <MSWSock.h>
-#include <windows.h>
+#include <iostream>
 #include <process.h>
 
-#include "chatserver.h"
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 namespace chatserver
 {
-    struct server
+struct server
+{
+    static constexpr size_t MAX_CONNECTIONS = 64;
+    static constexpr size_t BUFFER_SIZE = 1024;
+
+    SOCKET listen_socket = INVALID_SOCKET;
+    HANDLE iocp_handle = nullptr;
+    std::atomic<size_t> online_connections{0};
+};
+
+struct client
+{
+    SOCKET socket;
+};
+
+enum class op_type : uint8_t
+{
+    recv,
+    send
+};
+
+struct io_context
+{
+    OVERLAPPED overlapped{};
+    WSABUF buffer{};
+    char data[server::BUFFER_SIZE]{};
+    client *client = nullptr;
+    op_type kind{};
+};
+} // namespace chatserver
+
+namespace
+{
+chatserver::server g_server = {};
+std::vector<chatserver::client *> g_clients;
+std::mutex g_clients_mutex;
+} // namespace
+
+namespace
+{
+void receive(chatserver::io_context *context)
+{
+    DWORD flags = 0;
+    DWORD bytes = 0;
+
+    context->kind = chatserver::op_type::recv;
+    context->buffer.buf = context->data;
+    context->buffer.len = chatserver::server::BUFFER_SIZE;
+
+    int result = WSARecv(context->client->socket, &context->buffer, 1, &bytes, &flags, &context->overlapped, NULL);
+
+    if (result == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
     {
-        static constexpr size_t MAX_CONNECTIONS = 64;
-        static constexpr size_t BUFFER_SIZE = 128;
-
-        SOCKET listen_socket = INVALID_SOCKET;
-        HANDLE iocp_handle = nullptr;
-        size_t online_connections;
-    };
-
-    struct io_context {
-        OVERLAPPED overlapped;
-        WSABUF buffer;
-        char data[server::BUFFER_SIZE];
-        SOCKET clientSocket;
-    };
+        std::cerr << "WSARecv failed with error: " << WSAGetLastError() << std::endl;
+    }
 }
 
-static chatserver::server g_server = {};
-static chatserver::io_context g_contexts[chatserver::server::MAX_CONNECTIONS];
-
-namespace chatserver
+void send(chatserver::io_context *context, const char *msg, size_t len)
 {
-    static void send(size_t context_index, const char* message) {
-        WSABUF wsabuf;
-        wsabuf.buf = (char*)message;
-        wsabuf.len = static_cast<ULONG>(strlen(message));
+    DWORD bytes = 0;
 
-        DWORD bytesSent = 0;
-        DWORD flags = 0;
+    memcpy(context->data, msg, len);
+    context->buffer.buf = context->data;
+    context->buffer.len = static_cast<ULONG>(len);
+    context->kind = chatserver::op_type::send;
 
-        // Use the context's overlapped structure
-        ZeroMemory(&g_contexts[context_index].overlapped, sizeof(OVERLAPPED));
+    int result = WSASend(context->client->socket, &context->buffer, 1, &bytes, 0, &context->overlapped, NULL);
 
-        int result = WSASend(g_contexts[context_index].clientSocket, &wsabuf, 1, &bytesSent, flags, &g_contexts[context_index].overlapped, NULL);
-        if (result == SOCKET_ERROR) {
-            int errCode = WSAGetLastError();
-            if (errCode != WSA_IO_PENDING) {
-                std::cerr << "WSASend failed with error: " << errCode << std::endl;
-            }
-            else {
-                std::cout << "WSASend is pending..." << std::endl;
-            }
-        }
-        else {
-            std::cout << "Sent data immediately, bytes sent: " << bytesSent << std::endl;
-        }
-    }
-
-
-    static void receive(size_t context_index)
+    if (result == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
     {
-        io_context* context = &g_contexts[context_index];
-        context->buffer.buf = context->data;
-        context->buffer.len = g_server.BUFFER_SIZE - 1;
-        ZeroMemory(&context->overlapped, sizeof(OVERLAPPED));
-
-        DWORD flags = 0;
-        DWORD bytesReceived = 0;
-
-        int result = WSARecv(context->clientSocket, &context->buffer, 1, &bytesReceived, &flags, &context->overlapped, nullptr);
-        if (result == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
-            std::cerr << "WSARecv failed with error: " << WSAGetLastError() << std::endl;
-        }
+        std::cerr << "WSASend failed with error: " << WSAGetLastError() << std::endl;
     }
+}
 
-    static unsigned int WINAPI worker_thread(void* lpParam) {
-        while (true) {
-            DWORD bytesTransferred;
-            ULONG_PTR completionKey;
-            OVERLAPPED* overlapped;
+void post_receive()
+{
+}
 
-            BOOL result = GetQueuedCompletionStatus(g_server.iocp_handle, &bytesTransferred, &completionKey, &overlapped, INFINITE);
-            if (result == FALSE) {
-                DWORD error = GetLastError();
-                if (error == ERROR_ABANDONED_WAIT_0) {
-                    std::cerr << "Completion port closed. Exiting worker thread." << std::endl;
-                    break;
-                }
-                if (overlapped == nullptr) {
-                    std::cerr << "GetQueuedCompletionStatus failed with error: " << error << std::endl;
-                    continue;
-                }
-            }
+void post_send()
+{
+}
 
-            io_context* context = &g_contexts[(size_t)completionKey];
-
-            if (bytesTransferred == 0) {
-                // Client disconnected
-                if (context->clientSocket != INVALID_SOCKET) {
-                    std::cerr << "Client disconnected (Index: " << completionKey << ")\n";
-                    closesocket(context->clientSocket);
-                    context->clientSocket = INVALID_SOCKET;
-                }
-                continue;
-            }
-
-            if (bytesTransferred > 0) {
-                std::cout << "Received " << bytesTransferred << " bytes." << std::endl;
-                // Null-terminate the received data
-                context->buffer.buf[bytesTransferred] = '\0';
-                std::cout << "Received Data: " << context->buffer.buf << std::endl;
-
-                // Broadcast to all other connected clients
-                for (int i = 0; i < server::MAX_CONNECTIONS; i++) {
-                    if (g_contexts[i].clientSocket != INVALID_SOCKET && i != completionKey) {
-                        send(i, context->buffer.buf);
-                    }
-                }
-
-                // Post another receive operation for this client
-                receive(completionKey);
-            }
-        }
-        return 0;
-    }
-
-    bool initialize()
+void worker_thread()
+{
+    while (true)
     {
-        WSADATA wsaData;
-        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-            std::cerr << "WSAStartup failed" << std::endl;
-            return false;
-        }
+        DWORD bytesTransferred = 0;
+        ULONG_PTR completionKey = 0;
+        OVERLAPPED *overlapped = nullptr;
 
-        for (int i = 0; i < server::MAX_CONNECTIONS; i++) {
-            g_contexts[i].clientSocket = INVALID_SOCKET;
-            g_contexts[i].buffer.buf = g_contexts[i].data;
-            g_contexts[i].buffer.len = server::BUFFER_SIZE - 1;
-            ZeroMemory(&g_contexts[i].overlapped, sizeof(OVERLAPPED));
-        }
+        BOOL result =
+            GetQueuedCompletionStatus(g_server.iocp_handle, &bytesTransferred, &completionKey, &overlapped, INFINITE);
 
-        return true;
-    }
-
-    bool start_listening(const char* ipAddress, int port)
-    {
-        g_server.listen_socket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
-
-        if (g_server.listen_socket == SOCKET_ERROR)
+        if (!result && overlapped == nullptr)
         {
-            std::cerr << "Failed to create listen socket" << std::endl;
-            return false;
+            std::cerr << "GetQueuedCompletionStatus failed: " << GetLastError() << std::endl;
+            continue;
         }
 
-        sockaddr_in serverAddr = {};
-        serverAddr.sin_family = AF_INET;
-        serverAddr.sin_addr.s_addr = inet_addr(ipAddress);
-        serverAddr.sin_port = htons(port);
+        auto *context = reinterpret_cast<chatserver::io_context *>(overlapped);
+        if (!context)
+            continue;
 
-        if (bind(g_server.listen_socket, reinterpret_cast<const sockaddr*>(&serverAddr), sizeof(serverAddr)) == SOCKET_ERROR) 
+        if (bytesTransferred == 0)
         {
-            std::cerr << "Failed to bind listen socket" << std::endl;
-            return false;
+            std::lock_guard<std::mutex> lock(g_clients_mutex);
+            g_clients.erase(std::find(g_clients.begin(), g_clients.end(), context->client));
+            closesocket(context->client->socket);
+            delete context->client;
+            delete context;
+            g_server.online_connections--;
+            std::cout << "Client disconnected! Total online: " << g_server.online_connections << std::endl;
+            continue;
         }
 
-        if (listen(g_server.listen_socket, SOMAXCONN) == SOCKET_ERROR) 
+        if (context->kind == chatserver::op_type::recv)
         {
-            std::cerr << "Failed to listen socket" << std::endl;
-            return false;
-        }
+            std::string message(context->data, context->data + bytesTransferred);
+            std::cout << "Received: " << message << std::endl;
 
-        g_server.iocp_handle = CreateIoCompletionPort(reinterpret_cast<HANDLE>(g_server.listen_socket), NULL, 0, 0);
-        if (!g_server.iocp_handle) 
-        {
-            std::cerr << "IOCP creation failed" << std::endl;
-            return false;
-        }
-
-        return true;
-    }
-
-    void run(int thread_count)
-    {
-        for (int i = 0; i < thread_count; i++) 
-        {
-            _beginthreadex(nullptr, 0, worker_thread, nullptr, 0, nullptr);
-        }
-
-        while (true) 
-        {
-            sockaddr_in clientAddr;
-            int clientAddrSize = sizeof(clientAddr);
-            size_t context_index = 0;
-            for (size_t i = 0; i < server::MAX_CONNECTIONS; i++)
+            // Echo back to all clients
+            std::lock_guard<std::mutex> lock(g_clients_mutex);
+            for (auto *c : g_clients)
             {
-                if (g_contexts[i].clientSocket == INVALID_SOCKET)
-                {
-                    context_index = i;
-                    break;
-                }
+                auto *send_ctx = new chatserver::io_context{};
+                send_ctx->client = c;
+                send(send_ctx, message.c_str(), message.size());
             }
 
-            g_contexts[context_index].clientSocket = accept(g_server.listen_socket, (sockaddr*)&clientAddr, &clientAddrSize);
-            if (g_contexts[context_index].clientSocket == INVALID_SOCKET) {
-                std::cerr << "Failed to accept client connection" << std::endl;
-                return;
-            }
-
-            std::cout << "Client Accepted (Index: " << context_index << ")\n";
-            CreateIoCompletionPort((HANDLE)g_contexts[context_index].clientSocket, g_server.iocp_handle, (ULONG_PTR)context_index, 0);
-
-            receive(context_index);
+            ZeroMemory(&context->overlapped, sizeof(OVERLAPPED));
+            receive(context);
         }
-    }
-
-    void shutdown()
-    {
-        if (g_server.listen_socket != INVALID_SOCKET) {
-            closesocket(g_server.listen_socket);
+        else if (context->kind == chatserver::op_type::send)
+        {
+            delete context;
         }
-        if (g_server.iocp_handle) {
-            CloseHandle(g_server.iocp_handle);
-        }
-
-        WSACleanup();
     }
 }
+
+} // namespace
+
+namespace chatserver
+{
+bool initialize()
+{
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+    {
+        std::cerr << "WSAStartup failed" << std::endl;
+        return false;
+    }
+    return true;
+}
+
+bool start_listening(const char *ipAddress, int port)
+{
+    g_server.listen_socket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+
+    if (g_server.listen_socket == INVALID_SOCKET)
+    {
+        std::cerr << "Failed to create listen socket" << std::endl;
+        return false;
+    }
+
+    sockaddr_in serverAddr = {};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = inet_addr(ipAddress);
+    serverAddr.sin_port = htons(port);
+
+    if (bind(g_server.listen_socket, reinterpret_cast<const sockaddr *>(&serverAddr), sizeof(serverAddr)) ==
+        SOCKET_ERROR)
+    {
+        std::cerr << "Failed to bind listen socket" << std::endl;
+        return false;
+    }
+
+    if (listen(g_server.listen_socket, SOMAXCONN) == SOCKET_ERROR)
+    {
+        std::cerr << "Failed to listen on socket" << std::endl;
+        return false;
+    }
+
+    g_server.iocp_handle = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+    if (!g_server.iocp_handle)
+    {
+        std::cerr << "IOCP creation failed" << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+void run(int thread_count)
+{
+    for (int i = 0; i < thread_count; i++)
+    {
+        std::thread(worker_thread).detach();
+    }
+
+    while (true)
+    {
+        sockaddr_in clientAddr;
+        int clientAddrSize = sizeof(clientAddr);
+
+        SOCKET clientSocket = accept(g_server.listen_socket, (sockaddr *)&clientAddr, &clientAddrSize);
+        if (clientSocket == INVALID_SOCKET)
+        {
+            std::cerr << "Failed to accept client connection" << std::endl;
+            continue;
+        }
+
+        auto *c = new chatserver::client{clientSocket};
+        {
+            std::lock_guard<std::mutex> lock(g_clients_mutex);
+            g_clients.push_back(c);
+        }
+
+        std::cout << "Client connected! Total online: " << ++g_server.online_connections << std::endl;
+
+        CreateIoCompletionPort((HANDLE)c->socket, g_server.iocp_handle, 0, 0);
+
+        auto *context = new chatserver::io_context{};
+        context->client = c;
+        ZeroMemory(&context->overlapped, sizeof(OVERLAPPED));
+        receive(context);
+    }
+}
+
+void shutdown()
+{
+    if (g_server.listen_socket != INVALID_SOCKET)
+    {
+        closesocket(g_server.listen_socket);
+    }
+    if (g_server.iocp_handle)
+    {
+        CloseHandle(g_server.iocp_handle);
+    }
+
+    WSACleanup();
+}
+} // namespace chatserver

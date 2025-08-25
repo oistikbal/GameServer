@@ -11,6 +11,6 @@ namespace GameServerApi.Data
 
     public class User : IdentityUser
     {
-
+        new Interlocked();
     }
 }
