@@ -51,14 +51,16 @@ std::mutex g_clients_mutex;
 
 namespace
 {
-void receive(chatserver::io_context *context)
+void receive(chatserver::client* client)
 {
     DWORD flags = 0;
     DWORD bytes = 0;
 
+    chatserver::io_context *context = new chatserver::io_context();
     context->kind = chatserver::op_type::recv;
     context->buffer.buf = context->data;
     context->buffer.len = chatserver::server::BUFFER_SIZE;
+    context->client = client;
 
     int result = WSARecv(context->client->socket, &context->buffer, 1, &bytes, &flags, &context->overlapped, NULL);
 
@@ -68,14 +70,16 @@ void receive(chatserver::io_context *context)
     }
 }
 
-void send(chatserver::io_context *context, const char *msg, size_t len)
+void send(chatserver::client *client, const char *msg, size_t len)
 {
     DWORD bytes = 0;
 
+    chatserver::io_context *context = new chatserver::io_context();
     memcpy(context->data, msg, len);
     context->buffer.buf = context->data;
     context->buffer.len = static_cast<ULONG>(len);
     context->kind = chatserver::op_type::send;
+    context->client = client;
 
     int result = WSASend(context->client->socket, &context->buffer, 1, &bytes, 0, &context->overlapped, NULL);
 
@@ -85,12 +89,28 @@ void send(chatserver::io_context *context, const char *msg, size_t len)
     }
 }
 
-void post_receive()
+void post_receive(chatserver::io_context *context, DWORD bytesTransferred)
 {
+    std::string message(context->data, context->data + bytesTransferred);
+    std::cout << "Received: " << message << std::endl;
+
+    // Echo back to all clients
+    std::lock_guard<std::mutex> lock(g_clients_mutex);
+
+    for (auto *client : g_clients)
+    {
+
+        send(client, message.c_str(), message.size());
+    }
+
+    receive(context->client);
+    delete context;
 }
 
-void post_send()
+void post_send(chatserver::io_context *context)
 {
+    std::cout << "Send packet to: " << context->client << std::endl;
+    delete context;
 }
 
 void worker_thread()
@@ -128,24 +148,11 @@ void worker_thread()
 
         if (context->kind == chatserver::op_type::recv)
         {
-            std::string message(context->data, context->data + bytesTransferred);
-            std::cout << "Received: " << message << std::endl;
-
-            // Echo back to all clients
-            std::lock_guard<std::mutex> lock(g_clients_mutex);
-            for (auto *c : g_clients)
-            {
-                auto *send_ctx = new chatserver::io_context{};
-                send_ctx->client = c;
-                send(send_ctx, message.c_str(), message.size());
-            }
-
-            ZeroMemory(&context->overlapped, sizeof(OVERLAPPED));
-            receive(context);
+            post_receive(context, bytesTransferred);
         }
         else if (context->kind == chatserver::op_type::send)
         {
-            delete context;
+            post_send(context);
         }
     }
 }
@@ -232,10 +239,7 @@ void run(int thread_count)
 
         CreateIoCompletionPort((HANDLE)c->socket, g_server.iocp_handle, 0, 0);
 
-        auto *context = new chatserver::io_context{};
-        context->client = c;
-        ZeroMemory(&context->overlapped, sizeof(OVERLAPPED));
-        receive(context);
+        receive(c);
     }
 }
 
