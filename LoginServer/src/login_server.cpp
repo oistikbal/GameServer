@@ -1,6 +1,8 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include <WinSock2.h>
+
+#include <MSWSock.h>
 #include <iostream>
 #include <process.h>
 
@@ -40,7 +42,14 @@ struct io_context
     client *client = nullptr;
     op_type kind{};
 };
-} // namespace chatserver
+
+struct accept_context
+{
+    OVERLAPPED overlapped{};
+    SOCKET acceptSocket = INVALID_SOCKET;
+    char buffer[(sizeof(sockaddr_in) + 16) * 2]; // space for local + remote addresses
+};
+} // namespace login_server
 
 namespace
 {
@@ -51,7 +60,7 @@ std::mutex g_clients_mutex;
 
 namespace
 {
-void receive(login_server::client* client)
+void receive(login_server::client *client)
 {
     DWORD flags = 0;
     DWORD bytes = 0;
@@ -113,6 +122,43 @@ void post_send(login_server::io_context *context)
     delete context;
 }
 
+void accept()
+{
+    auto *ctx = new login_server::accept_context();
+    ctx->acceptSocket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+
+    DWORD bytes = 0;
+    BOOL result = AcceptEx(g_server.listen_socket, ctx->acceptSocket, ctx->buffer, 0, sizeof(sockaddr_in) + 16,
+                           sizeof(sockaddr_in) + 16, &bytes, &ctx->overlapped);
+
+    if (!result && WSAGetLastError() != ERROR_IO_PENDING)
+    {
+        std::cerr << "AcceptEx failed: " << WSAGetLastError() << std::endl;
+        closesocket(ctx->acceptSocket);
+        delete ctx;
+    }
+}
+
+void post_accept(login_server::accept_context *context)
+{
+    auto *c = new login_server::client{context->acceptSocket};
+    {
+        std::lock_guard<std::mutex> lock(g_clients_mutex);
+        g_clients.push_back(c);
+    }
+
+    setsockopt(context->acceptSocket, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, (char *)&g_server.listen_socket,
+               sizeof(g_server.listen_socket));
+
+    CreateIoCompletionPort((HANDLE)c->socket, g_server.iocp_handle, 0, 0);
+
+    std::cout << "Client connected! Total online: " << ++g_server.online_connections << std::endl;
+
+    receive(c);
+    delete context;
+    accept();
+}
+
 void worker_thread()
 {
     while (true)
@@ -130,29 +176,39 @@ void worker_thread()
             continue;
         }
 
-        auto *context = reinterpret_cast<login_server::io_context *>(overlapped);
-        if (!context)
-            continue;
+        if ((SOCKET)completionKey != g_server.listen_socket)
+        {
+            auto *context = reinterpret_cast<login_server::io_context *>(overlapped);
 
-        if (bytesTransferred == 0)
-        {
-            std::lock_guard<std::mutex> lock(g_clients_mutex);
-            g_clients.erase(std::find(g_clients.begin(), g_clients.end(), context->client));
-            closesocket(context->client->socket);
-            delete context->client;
-            delete context;
-            g_server.online_connections--;
-            std::cout << "Client disconnected! Total online: " << g_server.online_connections << std::endl;
-            continue;
-        }
+            if (bytesTransferred == 0)
+            {
+                std::lock_guard<std::mutex> lock(g_clients_mutex);
+                g_clients.erase(std::find(g_clients.begin(), g_clients.end(), context->client));
+                closesocket(context->client->socket);
+                delete context->client;
+                delete context;
+                g_server.online_connections--;
+                std::cout << "Client disconnected! Total online: " << g_server.online_connections << std::endl;
+                continue;
+            }
 
-        if (context->kind == login_server::op_type::recv)
-        {
-            post_receive(context, bytesTransferred);
+            if (context->kind == login_server::op_type::recv)
+            {
+                post_receive(context, bytesTransferred);
+            }
+            else if (context->kind == login_server::op_type::send)
+            {
+                post_send(context);
+            }
         }
-        else if (context->kind == login_server::op_type::send)
+        else if ((SOCKET)completionKey == g_server.listen_socket)
         {
-            post_send(context);
+            auto *context = reinterpret_cast<login_server::accept_context *>(overlapped);
+            post_accept(context);
+        }
+        else
+        {
+            continue;
         }
     }
 }
@@ -207,6 +263,12 @@ bool start_listening(const char *ipAddress, int port)
         return false;
     }
 
+    if (!CreateIoCompletionPort((HANDLE)g_server.listen_socket, g_server.iocp_handle, g_server.listen_socket, 0))
+    {
+        std::cerr << "Failed to associate listen socket with IOCP" << std::endl;
+        return false;
+    }
+
     return true;
 }
 
@@ -217,30 +279,14 @@ void run(int thread_count)
         std::thread(worker_thread).detach();
     }
 
+    for (int i = 0; i < 4; i++)
+    {
+        accept();
+    }
+
     while (true)
     {
-        sockaddr_in clientAddr;
-        int clientAddrSize = sizeof(clientAddr);
-
-        SOCKET clientSocket = accept(g_server.listen_socket, (sockaddr *)&clientAddr, &clientAddrSize);
-        if (clientSocket == INVALID_SOCKET)
-        {
-            int err = WSAGetLastError();
-            std::cerr << "Accept failed with error: " << err << std::endl;
-            continue;
-        }
-
-        auto *c = new login_server::client{clientSocket};
-        {
-            std::lock_guard<std::mutex> lock(g_clients_mutex);
-            g_clients.push_back(c);
-        }
-
-        std::cout << "Client connected! Total online: " << ++g_server.online_connections << std::endl;
-
-        CreateIoCompletionPort((HANDLE)c->socket, g_server.iocp_handle, 0, 0);
-
-        receive(c);
+        SwitchToThread();
     }
 }
 
@@ -257,4 +303,4 @@ void shutdown()
 
     WSACleanup();
 }
-} // namespace chatserver
+} // namespace login_server

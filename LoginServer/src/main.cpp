@@ -20,8 +20,8 @@ int main(int argc, char *argv[])
             threadCount = atoi(argv[i + 1]);
             if (threadCount <= 0)
             {
-                std::cout << ("Invalid thread count. Defaulting to 1.\n");
-                threadCount = 1;
+                std::cout << "Invalid thread count. Defaulting to: " << sysInfo.dwNumberOfProcessors;
+                threadCount = sysInfo.dwNumberOfProcessors;
             }
             i++;
         }
