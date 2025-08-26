@@ -9,7 +9,7 @@
 #include <thread>
 #include <vector>
 
-namespace chatserver
+namespace login_server
 {
 struct server
 {
@@ -44,22 +44,22 @@ struct io_context
 
 namespace
 {
-chatserver::server g_server = {};
-std::vector<chatserver::client *> g_clients;
+login_server::server g_server = {};
+std::vector<login_server::client *> g_clients;
 std::mutex g_clients_mutex;
 } // namespace
 
 namespace
 {
-void receive(chatserver::client* client)
+void receive(login_server::client* client)
 {
     DWORD flags = 0;
     DWORD bytes = 0;
 
-    chatserver::io_context *context = new chatserver::io_context();
-    context->kind = chatserver::op_type::recv;
+    login_server::io_context *context = new login_server::io_context();
+    context->kind = login_server::op_type::recv;
     context->buffer.buf = context->data;
-    context->buffer.len = chatserver::server::BUFFER_SIZE;
+    context->buffer.len = login_server::server::BUFFER_SIZE;
     context->client = client;
 
     int result = WSARecv(context->client->socket, &context->buffer, 1, &bytes, &flags, &context->overlapped, NULL);
@@ -70,15 +70,15 @@ void receive(chatserver::client* client)
     }
 }
 
-void send(chatserver::client *client, const char *msg, size_t len)
+void send(login_server::client *client, const char *msg, size_t len)
 {
     DWORD bytes = 0;
 
-    chatserver::io_context *context = new chatserver::io_context();
+    login_server::io_context *context = new login_server::io_context();
     memcpy(context->data, msg, len);
     context->buffer.buf = context->data;
     context->buffer.len = static_cast<ULONG>(len);
-    context->kind = chatserver::op_type::send;
+    context->kind = login_server::op_type::send;
     context->client = client;
 
     int result = WSASend(context->client->socket, &context->buffer, 1, &bytes, 0, &context->overlapped, NULL);
@@ -89,7 +89,7 @@ void send(chatserver::client *client, const char *msg, size_t len)
     }
 }
 
-void post_receive(chatserver::io_context *context, DWORD bytesTransferred)
+void post_receive(login_server::io_context *context, DWORD bytesTransferred)
 {
     std::string message(context->data, context->data + bytesTransferred);
     std::cout << "Received: " << message << std::endl;
@@ -107,7 +107,7 @@ void post_receive(chatserver::io_context *context, DWORD bytesTransferred)
     delete context;
 }
 
-void post_send(chatserver::io_context *context)
+void post_send(login_server::io_context *context)
 {
     std::cout << "Send packet to: " << context->client << std::endl;
     delete context;
@@ -130,7 +130,7 @@ void worker_thread()
             continue;
         }
 
-        auto *context = reinterpret_cast<chatserver::io_context *>(overlapped);
+        auto *context = reinterpret_cast<login_server::io_context *>(overlapped);
         if (!context)
             continue;
 
@@ -146,11 +146,11 @@ void worker_thread()
             continue;
         }
 
-        if (context->kind == chatserver::op_type::recv)
+        if (context->kind == login_server::op_type::recv)
         {
             post_receive(context, bytesTransferred);
         }
-        else if (context->kind == chatserver::op_type::send)
+        else if (context->kind == login_server::op_type::send)
         {
             post_send(context);
         }
@@ -159,7 +159,7 @@ void worker_thread()
 
 } // namespace
 
-namespace chatserver
+namespace login_server
 {
 bool initialize()
 {
@@ -225,11 +225,12 @@ void run(int thread_count)
         SOCKET clientSocket = accept(g_server.listen_socket, (sockaddr *)&clientAddr, &clientAddrSize);
         if (clientSocket == INVALID_SOCKET)
         {
-            std::cerr << "Failed to accept client connection" << std::endl;
+            int err = WSAGetLastError();
+            std::cerr << "Accept failed with error: " << err << std::endl;
             continue;
         }
 
-        auto *c = new chatserver::client{clientSocket};
+        auto *c = new login_server::client{clientSocket};
         {
             std::lock_guard<std::mutex> lock(g_clients_mutex);
             g_clients.push_back(c);

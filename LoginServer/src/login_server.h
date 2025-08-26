@@ -1,6 +1,6 @@
 #pragma once
 
-namespace chatserver
+namespace login_server
 {
     bool initialize();
     bool start_listening(const char* ip, int port);

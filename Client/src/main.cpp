@@ -52,11 +52,6 @@ void send_message(SOCKET client_socket, const std::string& message) {
     }
     else {
         std::cout << "Sent data immediately, result: " << result << ", bytes sent: " << bytesSent << std::endl;
-        struct sockaddr_in addr;
-        int addr_len = sizeof(addr);
-        if (getpeername(client_socket, (struct sockaddr*)&addr, &addr_len) == 0) {
-            std::cout << "Connected to: " << inet_ntoa(addr.sin_addr) << ":" << ntohs(addr.sin_port) << std::endl;
-        }
     }
 }
 
